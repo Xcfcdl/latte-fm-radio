@@ -12,12 +12,15 @@ tplgdir=${TPLG_DIR:-/lib/firmware/intel/sof-tplg}
 
 command -v cc >/dev/null || { echo "error: a C compiler (cc) is required" >&2; exit 1; }
 
-install -d "$bindir" "$tplgdir" /usr/share/applications /etc/systemd/user
+install -d "$bindir" "$tplgdir" /usr/share/applications /etc/systemd/user \
+	/etc/xdg/autostart
 
 install -m 755 "$here/fm-radio" "$bindir/fm-radio"
 install -m 755 "$here/fm-listen.sh" "$bindir/fm-listen.sh"
 install -m 755 "$here/latte-jack-switch" "$bindir/latte-jack-switch"
 install -m 644 "$here/fm-radio.desktop" /usr/share/applications/fm-radio.desktop
+install -m 644 "$here/fm-radio-autostart.desktop" \
+	/etc/xdg/autostart/fm-radio.desktop
 install -m 644 "$here/latte-jack-switch.service" /etc/systemd/user/latte-jack-switch.service
 
 install -m 644 "$here/../sof/sof-cht-rt5659.tplg" "$tplgdir/sof-cht-rt5659.tplg"
@@ -37,6 +40,7 @@ cat <<'EOF'
 Installed:
   /usr/local/bin/{hci_fm,fm-radio,fm-listen.sh,latte-jack-switch}
   /usr/share/applications/fm-radio.desktop
+  /etc/xdg/autostart/fm-radio.desktop
   /etc/systemd/user/latte-jack-switch.service
   /lib/firmware/intel/sof-tplg/sof-cht-rt5659.tplg
 

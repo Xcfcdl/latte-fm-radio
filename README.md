@@ -187,6 +187,21 @@ play stop
 7. 有音频流打开时不要卸载/重载 SOF 模块。
 8. 双 Profile 蓝牙耳机在切 Profile 的瞬间会同时出现 A2DP 与免提两个 sink。收音机只路由到 A2DP：免提是 8/16 kHz 单声道的 SCO 通道，切过去会没声或严重劣化，前端已默认隐藏免提节点。判断依据是 `api.bluez5.profile`——本板子上 SCO 节点复用 A2DP 的节点名，名字里没有 `head-unit`。
 
+## 重启与开机自启
+
+重启后会自动恢复的东西：
+
+- `/usr/local/bin/{fm-radio,hci_fm,fm-listen.sh,latte-jack-switch}`、拓扑、UCM、内核模块（都在磁盘上）
+- `~/.config/fm-radio/config.json`：频率、音量、输出、录音时长，以及未到期的定时录音（错过的超过 1 分钟则作废）
+- `~/Music/fm-radio/` 里的录音
+- 插孔守护 `latte-jack-switch.service`（systemd user，已 enable）
+- App 本身：`install.sh` 会装 `/etc/xdg/autostart/fm-radio.desktop`，登录即启动
+- App 启动时会先清掉上一轮残留的 loopback 和 FM 电源状态，不会带着脏状态起来
+
+会丢的：
+
+- 正在进行的录音会中断。正常关机时 `parecord` 收到 SIGTERM 会收尾，文件仍可播放；直接断电可能留下长度写不回头的 WAV（未实测）
+
 ## 故障恢复
 
 ### 所有输出都没有声音
