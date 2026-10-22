@@ -16,6 +16,7 @@ import socket
 import subprocess
 import threading
 import time
+from datetime import datetime, timedelta
 
 import gi
 
@@ -51,6 +52,9 @@ ACTIVE_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
 FM_MIN, FM_MAX = 87.5, 108.0
 CODEC_SWITCHES = (6, 91, 93, 102, 107, 162, 163, 27)
 DEFAULT_VOLUME = 20
+REC_RATE = 48000
+REC_CHANNELS = 1
+REC_MIN, REC_MAX = 1, 240
 SCAN_RSSI_MIN = 32
 SCAN_SNR_MIN = 9
 VERIFY_RSSI_MIN = 30
@@ -177,6 +181,36 @@ def jack_state():
         return (r.stdout or "").strip().endswith("values=on")
     except Exception:
         return None
+
+
+def rec_dir():
+    base = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_MUSIC)
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), "Music")
+    return os.path.join(base, "fm-radio")
+
+
+def rec_seconds(path):
+    """Duration of a recording, from its WAV payload size."""
+    try:
+        return max(0, (os.path.getsize(path) - 44) // (REC_RATE * REC_CHANNELS * 2))
+    except OSError:
+        return 0
+
+
+def fmt_dur(seconds):
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return "%d:%02d:%02d" % (h, m, s) if h else "%02d:%02d" % (m, s)
+
+
+def fmt_size(nbytes):
+    if nbytes >= 1024 ** 3:
+        return "%.2f GB" % (nbytes / 1024.0 ** 3)
+    if nbytes >= 1024 ** 2:
+        return "%.1f MB" % (nbytes / 1024.0 ** 2)
+    return "%d KB" % max(1, nbytes // 1024)
 
 
 class FMChip:
@@ -581,6 +615,46 @@ class Player:
         self.loop_id = None
 
 
+class Recorder:
+    """Capture the FM stream to a WAV file straight from the ALSA source.
+
+    Recording taps the capture node directly, so it does not depend on the
+    output routing: it keeps running while the radio is muted, routed to
+    Bluetooth, or not being listened to at all.
+    """
+
+    def __init__(self):
+        self.proc = None
+        self.path = None
+        self.started = 0.0
+        self.minutes = 0
+
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def begin(self, path, minutes):
+        self.path = path
+        self.started = time.time()
+        self.minutes = minutes
+        self.proc = subprocess.Popen(
+            ["parecord", "--device=" + SRC, "--format=s16le",
+             "--rate=%d" % REC_RATE, "--channels=%d" % REC_CHANNELS,
+             "--file-format=wav", path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def end(self):
+        p, self.proc = self.proc, None
+        if p is not None and p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+        path, self.path = self.path, None
+        return path
+
+
 class Spectrum(threading.Thread):
     N = 1024
     BANDS = 46
@@ -760,6 +834,12 @@ class App(Gtk.Window):
         self.control = None
         self._suppress = False
         self._tune_source = 0
+        self.rec = Recorder()
+        self.rec_minutes = 30
+        self.rec_at = None
+        self._rec_powered = False
+        self._play_proc = None
+        self._play_path = None
 
         self._load()
         self._build_ui()
@@ -787,6 +867,10 @@ class App(Gtk.Window):
             self.current = clamp(float(c.get("freq", 94.6)), FM_MIN, FM_MAX)
             self.volume = clamp(int(c.get("volume", DEFAULT_VOLUME)), 0, 100)
             self.output = str(c.get("output", "speaker"))
+            self.rec_minutes = clamp(int(c.get("rec_minutes", 30)), REC_MIN, REC_MAX)
+            at = float(c["rec_at"]) if c.get("rec_at") else None
+            # a schedule that expired while the app was closed is dropped
+            self.rec_at = at if at and at > time.time() - 60 else None
         except Exception:
             pass
 
@@ -794,7 +878,9 @@ class App(Gtk.Window):
         try:
             with open(CONF_FILE, "w") as f:
                 json.dump({"freq": self.current, "volume": self.volume,
-                           "output": self.output}, f)
+                           "output": self.output,
+                           "rec_minutes": self.rec_minutes,
+                           "rec_at": self.rec_at}, f)
         except Exception:
             pass
 
@@ -1053,6 +1139,74 @@ class App(Gtk.Window):
         self.hist_scroll = hi_scroll
         hi_card.pack_start(hi_scroll, False, False, 0)
         right.pack_start(hi_card, False, False, 0)
+
+        # recordings card
+        rec_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        rec_card.get_style_context().add_class("card")
+        rec_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        rec_lbl = Gtk.Label(label="录音")
+        rec_lbl.get_style_context().add_class("section")
+        rec_lbl.set_halign(Gtk.Align.START)
+        rec_head.pack_start(rec_lbl, False, False, 0)
+        self.rec_status = Gtk.Label(label="")
+        self.rec_status.get_style_context().add_class("empty")
+        self.rec_status.set_ellipsize(Pango.EllipsizeMode.END)
+        self.rec_status.set_halign(Gtk.Align.END)
+        rec_head.pack_start(self.rec_status, True, True, 0)
+        rec_card.pack_start(rec_head, False, False, 0)
+
+        rec_row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        dur_lbl = Gtk.Label(label="时长")
+        dur_lbl.get_style_context().add_class("status")
+        rec_row1.pack_start(dur_lbl, False, False, 0)
+        self.rec_spin = Gtk.SpinButton.new_with_range(REC_MIN, REC_MAX, 5)
+        self.rec_spin.set_value(self.rec_minutes)
+        self.rec_spin.set_numeric(True)
+        self.rec_spin.connect("value-changed", self._on_rec_minutes)
+        rec_row1.pack_start(self.rec_spin, False, False, 0)
+        unit_lbl = Gtk.Label(label="分钟")
+        unit_lbl.get_style_context().add_class("status")
+        rec_row1.pack_start(unit_lbl, False, False, 0)
+        self.rec_btn = Gtk.Button(label="● 立即录音")
+        self.rec_btn.get_style_context().add_class("flat-round")
+        self.rec_btn.connect("clicked", self._on_rec_now)
+        rec_row1.pack_start(self.rec_btn, True, True, 0)
+        rec_card.pack_start(rec_row1, False, False, 0)
+
+        rec_row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        at_lbl = Gtk.Label(label="定时")
+        at_lbl.get_style_context().add_class("status")
+        rec_row2.pack_start(at_lbl, False, False, 0)
+        self.rec_at_entry = Gtk.Entry()
+        self.rec_at_entry.set_width_chars(6)
+        self.rec_at_entry.set_max_length(5)
+        self.rec_at_entry.set_placeholder_text("HH:MM")
+        self.rec_at_entry.set_text(self._rec_at_text())
+        rec_row2.pack_start(self.rec_at_entry, False, False, 0)
+        self.rec_sched_btn = Gtk.Button(label="定时录音")
+        self.rec_sched_btn.get_style_context().add_class("flat-round")
+        self.rec_sched_btn.connect("clicked", self._on_rec_sched)
+        rec_row2.pack_start(self.rec_sched_btn, True, True, 0)
+        self.rec_cancel_btn = Gtk.Button(label="取消定时")
+        self.rec_cancel_btn.get_style_context().add_class("flat-round")
+        self.rec_cancel_btn.connect("clicked", self._on_rec_cancel)
+        rec_row2.pack_start(self.rec_cancel_btn, False, False, 0)
+        rec_card.pack_start(rec_row2, False, False, 0)
+
+        self.rec_list = Gtk.ListBox()
+        self.rec_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        rec_scroll = Gtk.ScrolledWindow()
+        rec_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        rec_scroll.set_min_content_height(96)
+        rec_scroll.set_max_content_height(240)
+        rec_scroll.set_propagate_natural_height(True)
+        rec_scroll.add(self.rec_list)
+        self.rec_scroll = rec_scroll
+        rec_card.pack_start(rec_scroll, False, False, 0)
+        right.pack_start(rec_card, False, False, 0)
+
+        self._refresh_recordings()
+        GLib.timeout_add(1000, self._tick_jobs)
 
         self._refresh_outputs(initial=True)
         GLib.timeout_add(3000, self._poll_outputs)
@@ -1477,6 +1631,9 @@ class App(Gtk.Window):
     def _apply_tune(self):
         if self.busy or self.scanning:
             return
+        if self.rec.running():
+            self._set_status("录音中不能调台，请先停止录音")
+            return
         khz = int(round(self.current * 1000))
         self._set_busy(True)
         self._set_status("正在调谐…")
@@ -1611,12 +1768,15 @@ class App(Gtk.Window):
         self.player.set_mute(True)
         with self._audio_lock:
             self.player.loopback_off()
-            self.fm.off()
+            # a recording taps the capture node directly, so the tuner has to
+            # stay powered when only the monitoring side is switched off
+            if not self.rec.running():
+                self.fm.off()
         self.player.set_mute(False)
         self.player.route_off()
         self._clear_active()
         self._render_spectrum()
-        self._set_status("已停止")
+        self._set_status("已静音（录音继续）" if self.rec.running() else "已停止")
         self.power_btn.set_label("▶ 开始收听")
         ctx = self.power_btn.get_style_context()
         ctx.remove_class("stop")
@@ -1663,6 +1823,9 @@ class App(Gtk.Window):
 
     def _on_scan(self, btn):
         if self.busy or self.scanning or self._switching:
+            return
+        if self.rec.running():
+            self._set_status("录音中不能搜台，请先停止录音")
             return
         self.scanning = True
         self._cancel.clear()
@@ -1795,6 +1958,9 @@ class App(Gtk.Window):
 
     def _on_seek(self, direction):
         if self.busy or self.scanning or self._switching:
+            return
+        if self.rec.running():
+            self._set_status("录音中不能搜台，请先停止录音")
             return
         self.scanning = True
         self._cancel.clear()
@@ -1950,6 +2116,259 @@ class App(Gtk.Window):
         self._write_list(HIST_FILE, [])
         self._fill_history([])
 
+    # ---------- recording / playback ----------
+    def _rec_at_text(self):
+        if self.rec_at and self.rec_at > time.time():
+            return datetime.fromtimestamp(self.rec_at).strftime("%H:%M")
+        return (datetime.now() + timedelta(minutes=5)).strftime("%H:%M")
+
+    def _rec_schedule_at(self, text):
+        """Parse HH:MM into the next occurrence, as a unix timestamp."""
+        try:
+            hh, mm = [int(x) for x in text.strip().split(":")]
+            now = datetime.now()
+            at = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if at <= now:
+                at += timedelta(days=1)
+            return at.timestamp()
+        except Exception:
+            return None
+
+    def _on_rec_minutes(self, spin):
+        self.rec_minutes = int(spin.get_value())
+        self._save()
+
+    def _on_rec_sched(self, *_a):
+        at = self._rec_schedule_at(self.rec_at_entry.get_text())
+        if at is None:
+            self._set_status("定时格式应为 HH:MM")
+            return
+        self.rec_at = at
+        self._save()
+        self._set_status("将在 %s 开始录音 %d 分钟" %
+                         (datetime.fromtimestamp(at).strftime("%H:%M"),
+                          self.rec_minutes))
+
+    def _on_rec_cancel(self, *_a):
+        if self.rec_at is None:
+            return
+        self.rec_at = None
+        self._save()
+        self._set_status("已取消定时录音")
+
+    def _on_rec_now(self, *_a):
+        if self.rec.running():
+            self._stop_recording()
+        else:
+            self._start_recording(self.rec_minutes)
+
+    def _start_recording(self, minutes):
+        if self.rec.running() or self.busy or self.scanning:
+            return False
+        directory = rec_dir()
+        os.makedirs(directory, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        base = os.path.join(directory, "FM_%s_%.1fMHz_%dmin.wav" %
+                            (stamp, self.current, minutes))
+        path, n = base, 1
+        while os.path.exists(path):
+            path = base[:-4] + "_%d.wav" % n
+            n += 1
+        self.rec_at = None
+        self._save()
+        self._set_status("正在打开录音…")
+
+        def work():
+            with self._audio_lock:
+                # recording taps the capture node, so powering the tuner is
+                # enough; no loopback and no audible output are required
+                if not self.playing:
+                    self.fm.init()
+                    self.fm.tune(int(round(self.current * 1000)))
+                    self._rec_powered = True
+                self.rec.begin(path, minutes)
+            GLib.idle_add(self._after_rec_start, path, minutes)
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def _after_rec_start(self, path, minutes):
+        if not self.rec.running():
+            self.rec.end()
+            self.rec_btn.set_label("● 立即录音")
+            self._set_status("录音启动失败：%s" % os.path.basename(path))
+            return False
+        self.rec_btn.set_label("■ 停止录音")
+        self._refresh_recordings()
+        self._set_status("● 正在录音 %.1f MHz · %d 分钟 · %s" %
+                         (self.current, minutes, os.path.basename(path)))
+        return False
+
+    def _stop_recording(self, note=None):
+        path = self.rec.end()
+        if self._rec_powered:
+            self._rec_powered = False
+            if not self.playing:
+                self.player.set_mute(True)
+                with self._audio_lock:
+                    self.fm.off()
+                self.player.set_mute(False)
+                self.player.route_off()
+        self.rec_btn.set_label("● 立即录音")
+        self._refresh_recordings()
+        if path and os.path.exists(path):
+            self._set_status(note or "录音已保存：%s（%s）" %
+                             (os.path.basename(path), fmt_dur(rec_seconds(path))))
+        elif note:
+            self._set_status(note)
+
+    def _tick_jobs(self):
+        if self._shutting_down:
+            return False
+        now = time.time()
+        if self.rec_at and now >= self.rec_at and not self.rec.running():
+            if not self.busy and not self.scanning:
+                self._start_recording(self.rec_minutes)
+        if self.rec.running():
+            elapsed = now - self.rec.started
+            total = self.rec.minutes * 60
+            if elapsed >= total:
+                self._stop_recording(note="定时录音已完成（%s）" % fmt_dur(total))
+            else:
+                self.rec_status.set_text("%s / %s" % (fmt_dur(elapsed),
+                                                      fmt_dur(total)))
+        elif self.rec.proc is not None:
+            self._stop_recording(note="录音已中断")
+        else:
+            self.rec_status.set_text("")
+        if self._play_proc is not None and self._play_proc.poll() is not None:
+            self._play_proc = None
+            self._play_path = None
+            self._refresh_recordings()
+            self._set_status("回放结束")
+        return True
+
+    def _recordings(self):
+        directory = rec_dir()
+        try:
+            names = [n for n in os.listdir(directory) if n.endswith(".wav")]
+        except OSError:
+            return []
+        paths = [os.path.join(directory, n) for n in names]
+        try:
+            paths.sort(key=os.path.getmtime, reverse=True)
+        except OSError:
+            pass
+        return paths
+
+    def _refresh_recordings(self):
+        if not hasattr(self, "rec_list"):
+            return
+        for child in self.rec_list.get_children():
+            self.rec_list.remove(child)
+        paths = self._recordings()
+        if not paths:
+            row = Gtk.ListBoxRow()
+            lbl = Gtk.Label(label="还没有录音")
+            lbl.get_style_context().add_class("empty")
+            lbl.set_margin_top(6)
+            lbl.set_margin_bottom(6)
+            row.add(lbl)
+            self.rec_list.add(row)
+        else:
+            for path in paths[:40]:
+                self.rec_list.add(self._make_rec_row(path))
+        self.rec_list.show_all()
+
+    def _make_rec_row(self, path):
+        row = Gtk.ListBoxRow()
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        box.set_margin_top(4)
+        box.set_margin_bottom(4)
+        name = os.path.basename(path)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        title = Gtk.Label(label=name)
+        title.set_halign(Gtk.Align.START)
+        title.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        try:
+            nbytes = os.path.getsize(path)
+        except OSError:
+            nbytes = 0
+        meta = Gtk.Label(label="%s · %s" %
+                         (fmt_dur(rec_seconds(path)), fmt_size(nbytes)))
+        meta.get_style_context().add_class("empty")
+        meta.set_halign(Gtk.Align.START)
+        text.pack_start(title, False, False, 0)
+        text.pack_start(meta, False, False, 0)
+        box.pack_start(text, True, True, 0)
+        playing = (self._play_path == path and self._play_proc is not None
+                   and self._play_proc.poll() is None)
+        play = Gtk.Button(label="■" if playing else "▶")
+        play.get_style_context().add_class("flat-round")
+        play.connect("clicked", self._on_rec_play, path)
+        box.pack_start(play, False, False, 0)
+        delete = Gtk.Button(label="✕")
+        delete.get_style_context().add_class("flat-round")
+        delete.connect("clicked", self._on_rec_delete, path)
+        box.pack_start(delete, False, False, 0)
+        row.add(box)
+        return row
+
+    def _on_rec_play(self, _btn, path):
+        if self._play_proc is not None and self._play_path == path:
+            self._stop_playback()
+            self._set_status("回放已停止")
+            self._refresh_recordings()
+            return
+        if self.rec.running():
+            self._set_status("录音中不能回放，请先停止录音")
+            return
+        self._stop_playback()
+        if self.playing:
+            self._stop_play()
+        if not self.player.sink:
+            self.player.sink = SINK_LOCAL
+        self.player.set_volume(self.volume)
+        self._play_proc = subprocess.Popen(
+            ["paplay", "--device=" + self.player.sink, path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._play_path = path
+        self._refresh_recordings()
+        self._set_status("▶ 回放：%s" % os.path.basename(path))
+
+    def _stop_playback(self):
+        proc, self._play_proc = self._play_proc, None
+        self._play_path = None
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+    def _on_rec_delete(self, _btn, path):
+        if self.rec.running() and self.rec.path == path:
+            self._set_status("正在录制的文件不能删除")
+            return
+        dialog = Gtk.MessageDialog(transient_for=self, modal=True,
+                                   message_type=Gtk.MessageType.QUESTION,
+                                   buttons=Gtk.ButtonsType.OK_CANCEL,
+                                   text="删除录音？")
+        dialog.format_secondary_text(os.path.basename(path))
+        resp = dialog.run()
+        dialog.destroy()
+        if resp != Gtk.ResponseType.OK:
+            return
+        if self._play_path == path:
+            self._stop_playback()
+        try:
+            os.remove(path)
+            self._set_status("已删除 %s" % os.path.basename(path))
+        except OSError as exc:
+            self._set_status("删除失败：%s" % exc)
+        self._refresh_recordings()
+
     def _on_volume(self, scale):
         if self._vol_suppress:
             return
@@ -1976,6 +2395,14 @@ class App(Gtk.Window):
                         "outputs": [{"id": t, "label": l} for t, l in list_outputs()],
                         "jack": jack_state(),
                         "busy": self.busy, "scanning": self.scanning,
+                        "recording": self.rec.running(),
+                        "rec_path": self.rec.path,
+                        "rec_minutes": self.rec.minutes if self.rec.running()
+                        else self.rec_minutes,
+                        "rec_elapsed": int(time.time() - self.rec.started)
+                        if self.rec.running() else 0,
+                        "rec_at": self.rec_at,
+                        "playing_back": self._play_path,
                         "spec": spec, "status": self.status_label.get_text(),
                         "stations": self._sort_stations(
                             self._read_list(STATION_FILE))}
@@ -2032,6 +2459,72 @@ class App(Gtk.Window):
             if c == "volume" and len(parts) > 1:
                 self.vol_slider.set_value(float(parts[1]))
                 return {"ok": True}
+            if c == "record":
+                sub = parts[1] if len(parts) > 1 else ""
+                if sub == "start":
+                    mins = self.rec_minutes
+                    if len(parts) > 2:
+                        try:
+                            mins = clamp(int(parts[2]), REC_MIN, REC_MAX)
+                        except ValueError:
+                            return {"ok": False, "error": "minutes"}
+                    ok = self._start_recording(mins)
+                    return {"ok": ok, "minutes": mins,
+                            "error": None if ok else "busy"}
+                if sub == "stop":
+                    self._stop_recording()
+                    return {"ok": True}
+                if sub == "at" and len(parts) > 2:
+                    at = self._rec_schedule_at(parts[2])
+                    if at is None:
+                        return {"ok": False, "error": "HH:MM"}
+                    self.rec_at = at
+                    self._save()
+                    return {"ok": True, "at": at,
+                            "human": datetime.fromtimestamp(at).isoformat(timespec="minutes")}
+                if sub == "cancel":
+                    self.rec_at = None
+                    self._save()
+                    return {"ok": True}
+                return {"ok": True, "recording": self.rec.running(),
+                        "path": self.rec.path,
+                        "minutes": self.rec.minutes if self.rec.running()
+                        else self.rec_minutes,
+                        "elapsed": int(time.time() - self.rec.started)
+                        if self.rec.running() else 0,
+                        "scheduled": self.rec_at}
+            if c == "recordings":
+                items = []
+                for i, path in enumerate(self._recordings()):
+                    try:
+                        size = os.path.getsize(path)
+                        mtime = int(os.path.getmtime(path))
+                    except OSError:
+                        size, mtime = 0, 0
+                    items.append({"index": i, "name": os.path.basename(path),
+                                  "path": path, "seconds": rec_seconds(path),
+                                  "bytes": size, "mtime": mtime,
+                                  "playing": self._play_path == path})
+                return {"ok": True, "dir": rec_dir(), "items": items,
+                        "recording": self.rec.running()}
+            if c == "play" and len(parts) > 1:
+                if parts[1] == "stop":
+                    self._stop_playback()
+                    self._refresh_recordings()
+                    return {"ok": True}
+                paths = self._recordings()
+                target = None
+                if parts[1].isdigit() and int(parts[1]) < len(paths):
+                    target = paths[int(parts[1])]
+                else:
+                    for path in paths:
+                        if os.path.basename(path) == parts[1] or path == parts[1]:
+                            target = path
+                            break
+                if target is None:
+                    return {"ok": False, "error": "not found"}
+                self._on_rec_play(None, target)
+                return {"ok": True, "playing": self._play_path}
             if c == "style":
                 def info(w):
                     ctx = w.get_style_context()
@@ -2089,6 +2582,12 @@ class App(Gtk.Window):
         return False
 
     def _on_delete(self, *args):
+        try:
+            self._stop_playback()
+            if self.rec.running():
+                self.rec.end()
+        except Exception:
+            pass
         self._save()
         self._shutting_down = True
         self._cancel.set()
