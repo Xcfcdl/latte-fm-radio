@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Latte jack auto switch (Speaker/Headphones, FM-aware)
+After=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/latte-jack-switch
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,119 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Xcfcdl <746953609@qq.com>
+# Auto-switch codec routing between Speaker and Headphones.
+# The SOF card stays on the pro-audio profile; switching only touches RT5659
+# mixer controls, so no DSP/UCM reconfiguration is involved.
+# FM playback (marker or loopback active) sets its own route and holds it.
+
+CARD="alsa_card.platform-sof_cht_rt5659"
+FM_MARK="/run/user/$(id -u)/fm-radio-active"
+
+amix() {
+    sudo -n amixer -c 0 cset numid="$1" "$2" >/dev/null 2>&1
+}
+
+route_speaker() {
+    amix 6 on
+    amix 82 DAC_REF
+    amix 162 on
+    amix 163 on
+    amix 29 off
+    amix 164 off
+    amix 165 off
+}
+
+route_headphones() {
+    amix 29 on
+    amix 164 on
+    amix 165 on
+    amix 82 IF_ADC2
+    amix 6 on
+    amix 93 on
+    amix 95 on
+    amix 104 on
+    amix 109 on
+}
+
+jack_numid() {
+    amixer -c 0 controls 2>/dev/null |
+        sed -n "s/^numid=\([0-9]*\),.*Headphone Jack.*/\1/p" | head -1
+}
+
+card_profile() {
+    pactl list cards 2>/dev/null | awk -v n="$CARD" \
+        'index($0, "Name: " n){f=1} f && /Active Profile:/{sub(/.*Active Profile: /,""); print; exit}'
+}
+
+fm_active() {
+    if [ -r "$FM_MARK" ]; then
+        pid=$(cat "$FM_MARK" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        rm -f "$FM_MARK"
+    fi
+    pactl list short modules 2>/dev/null |
+        grep -q 'module-loopback.*platform-sof_cht_rt5659'
+}
+
+JACK_NUMID=$(jack_numid)
+echo "start: jack_numid=$JACK_NUMID"
+last=""
+stable=""
+route=""
+
+while true; do
+    if [ -z "$JACK_NUMID" ]; then
+        JACK_NUMID=$(jack_numid)
+    fi
+
+    if fm_active; then
+        if [ "$last" != "fm" ]; then
+            echo "$(date +%H:%M:%S) fm active, hold route"
+            last="fm"
+        fi
+        stable=""
+        sleep 1
+        continue
+    fi
+
+    if [ "$(card_profile)" != "pro-audio" ]; then
+        pactl set-card-profile "$CARD" pro-audio >/dev/null 2>&1
+    fi
+
+    jack=""
+    if [ -n "$JACK_NUMID" ]; then
+        jack=$(amixer -c 0 cget numid="$JACK_NUMID" 2>/dev/null |
+               tail -1 | sed 's/.*values=//')
+    fi
+
+    if [ "$jack" = "on" ]; then
+        want="headphones"
+    else
+        want="speaker"
+    fi
+
+    if [ "$jack" != "$last" ]; then
+        echo "$(date +%H:%M:%S) jack=${jack:-unknown} want=$want"
+        last="$jack"
+    fi
+
+    if [ "$want" != "$route" ]; then
+        if [ "$want" = "$stable" ]; then
+            if [ "$want" = "headphones" ]; then
+                route_headphones
+            else
+                route_speaker
+            fi
+            route="$want"
+            echo "$(date +%H:%M:%S) route -> $want"
+            stable=""
+        else
+            stable="$want"
+        fi
+    else
+        stable=""
+    fi
+    sleep 1
+done

@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Desktop Entry]
+Type=Application
+Name=FM 收音机
+Comment=BCM4356 FM radio for Mi Pad 2
+Exec=/usr/local/bin/fm-radio
+Icon=radio-symbolic
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+StartupNotify=true
