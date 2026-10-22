@@ -16,6 +16,42 @@
 - SOF 固件 `sof-cht.ri`（sof-bin v2.2，随发行版提供，不在本仓库）
   <https://github.com/thesofproject/sof-bin>
 
+## 状态与边界（封档）
+
+这是一个**机型级**项目：给 Cherry Trail 版小米平板 2 补上主线内核上的 SOF 音频与 BCM4356 FM。
+它不是 SOF 平台的新支持，也不打算复活 Bay Trail / Cherry Trail。
+
+平台状态（有来源）：
+
+- SOF 已把 BYT/CHT 转入维护模式，**v2.2 是最后一个带固件支持的版本**，之后不再做固件修复
+  （Intel 在 [issue #3868](https://github.com/thesofproject/sof/issues/3868) 的收尾说明）
+- 2023-01-27 提交 `89f7aa0ab` *platform: remove support for Baytrail and Cherrytrail*
+  把平台从 `main` 移除；历史支持在 `stable-v2.2` 分支
+- 固件只从 sof-bin `v2.2.x` 取：`sof-cht.ri`，md5 `95573d5a1ccf71c19fd7181b5653bc57`；本仓库不分发固件
+- 内核侧 `sound/soc/sof/intel/{byt,atom}.c` 仍在，但 2024–2025 只有 tree-wide 清理，没有新功能
+
+已知风险：
+
+- SOF 在 BYT/CHT 上有过"播放几分钟后持续蜂鸣"的历史报告（[#3868](https://github.com/thesofproject/sof/issues/3868)，
+  5.11–5.18 + SOF 2.1.x + rt5640）。本机（6.14 + v2.2 + 自写拓扑）连续听音未复现；
+  遇到长鸣先停 App 判断是否 loopback 叠加（本项目的长鸣就是它，已修复），再重启音频服务
+- 冻结平台的固件问题不会再有官方修复，接受这一点再使用
+
+为什么不用 SST：
+
+- SST 的 `cht_bsw_rt5659` 机器驱动只有 FE、SSP2-Codec 和 `dummy → TFA` 两条链路，
+  **没有 SSP1 采集**，BCM4356 的 FM 音频进不来；TFA 也不是真实 AIF2 c2c
+- 换回 SST = 放弃 FM
+
+关于"驱动是不是 SST 复制品"：
+
+- ASoC machine driver 本身就是板级接线（DAI link、DAPM、jack、功放），与 SST 板驱动共享硬件描述是必然的
+- 本驱动新增的是 SSP1 采集 BE、两路 `rt5659-aif2 → TFA9890` c2c、每次 `hw_params` 重写 PLL、`idle_bias_off`
+- 运行时 DSP 是 SOF：`snd_sof*` 已加载、拓扑 ABI 3:22:1、`ssp0..5-port` DAI 来自
+  `sound/soc/sof/intel/atom.c`、`amixer` 有拓扑的 PGA 控件；SST 的 `sst-mfld-platform` 组件并未注册
+
+开发状态：**封档**。只接受能复现的 bug 修复，不新增功能。
+
 ## 链路
 
 ```text
