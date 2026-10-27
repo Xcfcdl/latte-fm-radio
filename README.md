@@ -37,11 +37,30 @@
   遇到长鸣先停 App 判断是否 loopback 叠加（本项目的长鸣就是它，已修复），再重启音频服务
 - 冻结平台的固件问题不会再有官方修复，接受这一点再使用
 
-为什么不用 SST：
+为什么曾经不用 SST（**2026-10-26 已作废，改走 SST**）：
 
-- SST 的 `cht_bsw_rt5659` 机器驱动只有 FE、SSP2-Codec 和 `dummy → TFA` 两条链路，
-  **没有 SSP1 采集**，BCM4356 的 FM 音频进不来；TFA 也不是真实 AIF2 c2c
-- 换回 SST = 放弃 FM
+- 当时的理由：SST 的 `cht_bsw_rt5659` 机器驱动只有 FE、SSP2-Codec 和 `dummy → TFA`
+  两条链路，没有 SSP1 采集，BCM4356 的 FM 音频进不来
+- 这个前提是可以修的：我们往 `sst-atom-controls` / `sst-mfld-platform-pcm` /
+  `cht_bsw_rt5659` 上加了 SSP1 采集链路和两路 `rt5659-aif2 → TFA9890` c2c，
+  FM 在 SST 上已经跑通，见 [docs/INSTALL-7.2-FM.md](docs/INSTALL-7.2-FM.md)
+- 现在的架构（2026-10-27）走 SST：驱动只描述能力，UCM 负责路由，
+  `fm-tuner` 服务独占芯片并发布 `fm_radio` 源，图形前端只切 profile / 选输出
+
+SST 路线（当前）：
+
+```text
+BCM4356 FM ──SSP1(I2S, 16 bit slot)──> SST (ROM 固件) ──> PCM2 capture (hw:0,6)
+                                                            │
+                              fm-tuner 服务 ── pw-cli create-node ──> fm_radio 源
+                                                            │
+UI ── pw-record --target fm_radio ── aplay ──> RT5659 ─┬─ HPO L/R ── 3.5 mm（兼 FM 天线）
+                                                      └─ AIF2 ── 2 × TFA9890 ── 扬声器
+```
+
+- 芯片上电、调谐、RSSI/SNR 由 `fm-tuner` 通过 HCI VSC 完成；`hci_fm` 仍是底层命令工具
+- 插孔只上报，不做策略：耳机长期插着当天线，扬声器/耳机由 UCM profile 决定
+- 下面的 SOF 章节是 2026-10-26 之前的方案，保留作历史对照
 
 关于"驱动是不是 SST 复制品"：
 
@@ -79,16 +98,23 @@ latte-fm-radio/
 │   └── sof-cht-rt5659.tplg   已构建拓扑（md5 d8d68f860fda619bb63ae68c01804d1e）
 ├── tools/
 │   ├── hci_fm.c              BCM FM HCI VSC 工具（GPL-2.0，作者 arttttt）
-│   ├── fm-radio              GTK3 收音机前端
-│   ├── fm-listen.sh          命令行收听 / 扫描 / 停止
-│   ├── latte-jack-switch     插孔自动切换守护脚本
+│   ├── fm-radio              GTK3 收音机前端（只切 profile / 选输出）
+│   ├── fm-tuner              系统层调谐器：独占芯片 + 发布 fm_radio 源
+│   ├── fm-tuner.service      上面那个服务的 user unit
+│   ├── fm-sst               诊断 / 扫频，tuner 的客户端
+│   ├── fm-listen.sh          命令行收听 / 扫描 / 停止（SOF 时期）
+│   ├── latte-jack-switch     插孔自动切换守护脚本（SOF 时期）
 │   ├── latte-jack-switch.service
 │   ├── fm-radio.desktop
 │   └── install.sh
-├── Intel/ codecs/ conf.d/    旧 HiFi profile 的 UCM 覆盖（可选，见下）
+├── docs/
+│   └── INSTALL-7.2-FM.md     7.2 + FM-on-SST 的 bring-up 与实测记录
+├── Intel/ codecs/ conf.d/    UCM 覆盖（SST 路线的当前路由，见下）
 ```
 
-`Intel/`、`codecs/`、`conf.d/` 是旧 SST / HiFi profile 使用的 UCM 覆盖。SOF 实时收听路径固定用 `pro-audio`，不依赖它们；保留是为了兼容旧内核或需要 HiFi profile 的场景。
+`Intel/`、`codecs/`、`conf.d/` 是 UCM 覆盖文件：SST 路线靠它们做扬声器/耳机/麦克风路由
+（`Speaker Amp Switch` 决定功放供电，插孔只上报不决定策略）。装到
+`/usr/share/alsa/ucm2/` 对应位置后按 `HiFi (...)` profile 生效。
 
 ## 前置条件
 

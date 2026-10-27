@@ -1,21 +1,23 @@
 #!/usr/bin/python3
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (c) 2026 Xcfcdl <746953609@qq.com>
-"""FM radio front-end for the Mi Pad 2 (BCM4356 + SOF + rt5659).
+"""FM radio front-end for the Mi Pad 2 (BCM4356 + SST + rt5659).
 
-Talks to the FM chip through /usr/local/bin/hci_fm, plays through a
-PipeWire loopback and draws a live spectrum from the DSP capture.
+Talks to the FM chip through /usr/local/bin/hci_fm, plays the captured stream
+through PipeWire and draws a live spectrum from the same bytes.
 """
 
 import array
 import json
 import math
 import os
+import queue
 import re
 import socket
 import subprocess
 import threading
 import time
+import wave
 from datetime import datetime, timedelta
 
 import gi
@@ -24,24 +26,19 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango
 
-HCI = "/usr/local/bin/hci_fm"
-CARD = "alsa_card.platform-sof_cht_rt5659"
-PROFILE = "pro-audio"
-SRC = "alsa_input.platform-sof_cht_rt5659.pro-input-0"
-SINK_LOCAL = "alsa_output.platform-sof_cht_rt5659.pro-output-0"
+CARD = "alsa_card.platform-cht-bsw-rt5659"
+# The tuner belongs to the system layer: fm-tuner powers/tunes the chip and
+# publishes the captured stream as this PipeWire source. The UI only selects
+# the output device (a UCM profile) and reads the source.
+FM_SOURCE = "fm_radio"
+TUNER_SOCK = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid(),
+    "fm-tuner.sock")
+# Every output device is its own UCM profile, so the analog sink name carries
+# the active device (…HiFi__Speaker__sink / …HiFi__Headphones__sink) and changes
+# when the profile does. Only the prefix is stable.
+LOCAL_PREFIX = "alsa_output.platform-cht-bsw-rt5659."
 BT_PREFIX = "bluez_output."
-SPK_ROUTE = ((6, "on"), (82, "DAC_REF"), (162, "on"), (163, "on"),
-             (29, "off"), (164, "off"), (165, "off"))
-HP_ROUTE = ((29, "on"), (164, "on"), (165, "on"), (82, "IF_ADC2"),
-            (6, "on"), (93, "on"), (95, "on"), (104, "on"), (109, "on"))
-MIC_ROUTE = (("Int Mic Switch", "on"),
-             ("RECMIX1L BST3 Switch", "on"),
-             ("RECMIX1R BST4 Switch", "on"),
-             ("STO1 ADC Capture Switch", "on"),
-             ("Stereo1 ADC Source", "ADC1"),
-             ("Stereo1 ADC1 Source", "ADC"),
-             ("Stereo1 ADC MIXL ADC1 Switch", "on"),
-             ("Stereo1 ADC MIXR ADC1 Switch", "on"))
 CONF_DIR = os.path.expanduser("~/.config/fm-radio")
 CONF_FILE = os.path.join(CONF_DIR, "config.json")
 HIST_FILE = os.path.join(CONF_DIR, "history.json")
@@ -50,10 +47,12 @@ ACTIVE_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
                            "fm-radio-active")
 
 FM_MIN, FM_MAX = 87.5, 108.0
-CODEC_SWITCHES = (6, 91, 93, 102, 107, 162, 163, 27)
-DEFAULT_VOLUME = 20
+# PipeWire maps the sink volume onto the codec HP volume (100% -> 31,
+# 20% -> 1 = -22 dB), so a low default reads as silence on this board.
+DEFAULT_VOLUME = 60
 REC_RATE = 48000
-REC_CHANNELS = 1
+# the tuner is mono; the FW copies it into both slots of the SSP1 frame
+REC_CHANNELS = 2
 REC_MIN, REC_MAX = 1, 240
 SCAN_RSSI_MIN = 32
 SCAN_SNR_MIN = 9
@@ -162,10 +161,16 @@ def list_outputs():
     return out
 
 
-def sink_for(target):
-    if target in ("speaker", "headphones"):
-        return SINK_LOCAL
-    return target if target.startswith(BT_PREFIX) else SINK_LOCAL
+def local_sink():
+    """Live name of the board's analog sink, or None.
+
+    Speaker and headphones share this one node; the jack decides which device
+    the codec feeds, so the name must be read instead of hardcoded.
+    """
+    for name in list_sinks():
+        if name.startswith(LOCAL_PREFIX):
+            return name
+    return None
 
 
 def jack_state():
@@ -181,6 +186,29 @@ def jack_state():
         return (r.stdout or "").strip().endswith("values=on")
     except Exception:
         return None
+
+
+def fm_source_present():
+    """True when the tuner's source node is in the graph.
+
+    pw-record does not fail when --target is missing: WirePlumber quietly
+    falls back to the default source, which is the internal microphone. In a
+    player that becomes a microphone-to-speaker loop, so never start a stream
+    against a source that is not there.
+    """
+    try:
+        out = subprocess.run(["pw-dump"], capture_output=True, text=True,
+                             timeout=10).stdout
+        dump = json.loads(out)
+    except Exception:
+        return False
+    for obj in dump:
+        if obj.get("type") != "PipeWire:Interface:Node":
+            continue
+        props = (obj.get("info") or {}).get("props") or {}
+        if props.get("node.name") == FM_SOURCE:
+            return True
+    return False
 
 
 def rec_dir():
@@ -214,74 +242,62 @@ def fmt_size(nbytes):
 
 
 class FMChip:
+    """Client for the fm-tuner service.
+
+    The chip is a system-layer resource: the service owns the HCI power-up
+    sequence, keeps the "fm_radio" PipeWire source alive and serializes access.
+    Requests are one JSON object per connection.
+    """
+
     def __init__(self):
         self.lock = threading.Lock()
 
-    def _run(self, args, timeout=15):
+    def _call(self, cmd, sock_timeout=25, **kw):
+        req = {"cmd": cmd}
+        req.update(kw)
         try:
-            return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(sock_timeout)
+            s.connect(TUNER_SOCK)
+            s.sendall((json.dumps(req) + "\n").encode())
+            buf = b""
+            while not buf.endswith(b"\n"):
+                d = s.recv(65536)
+                if not d:
+                    break
+                buf += d
+            s.close()
+            rep = json.loads(buf.decode() or "{}")
         except Exception:
             return None
-
-    def _hci(self, args):
-        r = self._run(["sudo", "-n", HCI] + [str(a) for a in args])
-        if not r or r.returncode != 0:
-            return None
-        out = r.stdout.split()
-        return out[1:] if out and out[0] == "OK" else None
+        return rep.get("result") if rep.get("ok") else None
 
     def write(self, reg, val):
-        return self._hci(["write", hex(reg), str(val)]) is not None
+        return self._call("write", reg=int(reg), val=int(val)) is True
 
     def raw(self, *data):
-        return self._hci(["raw"] + [hex(d) for d in data]) is not None
+        return self._call("raw", data=[int(d) for d in data]) is True
 
     def vsc(self, *data):
-        return self._hci(["vsc"] + [hex(d) for d in data]) is not None
+        return self._call("vsc", data=[int(d) for d in data]) is True
 
     def read(self, reg, n=1):
-        out = self._hci(["read", hex(reg), str(n)])
-        if not out:
-            return None
-        try:
-            if n == 2 and len(out) >= 2:
-                return int(out[1] + out[0], 16)
-            return int(out[0], 16)
-        except ValueError:
-            return None
+        v = self._call("read", reg=int(reg), n=int(n))
+        return v if isinstance(v, int) else None
 
     def init(self, rds=False):
-        with self.lock:
-            self.raw(0x00, 0x00, 0x03 if rds else 0x01)  # FM on (+RDS)
-            self.raw(0xFB, 0x00, 0xE0, 0xAB, 0xE0, 0x2E)  # 108/76 MHz boundaries
-            self.write(0x01, 0x0003)                # west band + stereo
-            self.write(0xF8, 0x00FF)                # chip output level
-            if rds:
-                self.raw(0x02, 0x00, 0x02)          # flush RDS FIFO
-                self.raw(0x02, 0x00, 0x00)          # RDS (not RBDS)
-                self.raw(0x14, 0x00, 0x04)          # FIFO waterline
+        return self._call("init", sock_timeout=40, rds=bool(rds)) is True
 
     def off(self):
-        with self.lock:
-            self.raw(0x00, 0x00, 0x00)
+        self._call("off")
 
     def tune(self, khz, settle=0.85):
-        with self.lock:
-            self.write(0x0A, khz - 64000)
-            self.raw(0x09, 0x00, 0x01)
-            time.sleep(settle)
-            self.write(0x05, 0x006C)                # I2S out, 75 us
-            self.vsc(0x61, 0x07, 0x19, 0x18, 0x19, 0x19)
-        flag = self.read(0x12, 1)
-        rssi = self.read(0x0F, 1)
-        snr = self.read(0xDF, 1)
-        return flag, rssi, snr
+        r = self._call("tune", sock_timeout=40, khz=int(khz),
+                       settle=round(float(settle), 3))
+        return tuple(r) if isinstance(r, list) and len(r) == 3 else (None, None, None)
 
     def audio_on(self):
-        """Route the demodulated audio to the I2S output."""
-        with self.lock:
-            self.write(0x05, 0x006C)                # I2S out, 75 us
-            self.vsc(0x61, 0x07, 0x19, 0x18, 0x19, 0x19)
+        self._call("audio_on")
 
     def tune_wait(self, khz, timeout=0.8, settle=0.25):
         """Tune and wait for usable signal meters.
@@ -291,28 +307,15 @@ class FMChip:
         the meters the moment the flag turns 1 reports the old channel or a
         transient value (e.g. 8 dB instead of 12 dB on a strong station).
         """
-        self.write(0x0A, khz - 64000)
-        self.raw(0x09, 0x00, 0x01)
-        deadline = time.time() + timeout
-        flag = None
-        while time.time() < deadline:
-            time.sleep(0.06)
-            flag = self.read(0x12, 1)
-            if flag is not None and (flag & 3) != 0:
-                break
-        if flag is None or (flag & 3) != 1:
-            return flag, None, None
-        time.sleep(settle)
-        flag = self.read(0x12, 1)
-        if flag is None or (flag & 3) != 1:
-            return flag, None, None
-        return flag, self.read(0x0F, 1), self.read(0xDF, 1)
+        r = self._call("tune_wait", sock_timeout=40, khz=int(khz),
+                       timeout=float(timeout), settle=float(settle))
+        return tuple(r) if isinstance(r, list) and len(r) == 3 else (None, None, None)
 
     def status(self):
-        flag = self.read(0x12, 1)
-        rssi = self.read(0x0F, 1)
-        snr = self.read(0xDF, 1)
-        return flag, rssi, snr
+        rep = self._call("status")
+        if not isinstance(rep, dict):
+            return None, None, None
+        return rep.get("flag"), rep.get("rssi"), rep.get("snr")
 
     @staticmethod
     def rssi_dbu(raw):
@@ -323,7 +326,7 @@ class FMChip:
 
     def read_rds(self):
         """Read the RDS FIFO; returns [(block, value, valid), ...]."""
-        out = self._hci(["read", "0x80", "64"])
+        out = self._call("read_raw", reg=0x80, n=64)
         if not out:
             return []
         try:
@@ -390,48 +393,138 @@ class RDSText:
         return self._clean(self.rt)
 
 
-class Player:
+class FmStream:
+    """The one reader of the BT-FM capture, shared by playback, recording and
+    the spectrum.
+
+    PCM 5 takes a single reader, so the first consumer to attach opens it and
+    the last one to leave closes it. Callbacks run on the pump thread; anything
+    that could block has to queue instead of stalling everybody.
+    """
+
+    CHUNK = 8192
+
     def __init__(self):
-        self.loop_id = None
-        self.sink = SINK_LOCAL
+        self.proc = None
+        self.errf = None
+        self.thread = None
+        self.holders = set()
+        self.subs = []
+        self.lock = threading.Lock()
 
-    @staticmethod
-    def _amixer(args):
-        subprocess.run(["sudo", "-n", "amixer", "-c", "0", "cset"] + list(args),
-                       capture_output=True, text=True, timeout=10)
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
 
-    def codec_path_on(self):
-        for n in CODEC_SWITCHES:
-            self._amixer(["numid=%d" % n, "on"])
+    def attach(self, key, cb, hold=True):
+        with self.lock:
+            if hold:
+                self.holders.add(key)
+            if all(k != key for k, _ in self.subs):
+                self.subs.append((key, cb))
+            # a watcher rides along with somebody's stream, it never opens one
+            piggy = hold or bool(self.holders)
+        if not piggy:
+            return True
+        if not self._start():
+            self.detach(key)
+            return False
+        return True
 
-    def route_speaker(self):
-        for n, v in SPK_ROUTE:
-            self._amixer(["numid=%d" % n, v])
+    def detach(self, key):
+        with self.lock:
+            self.subs = [(k, cb) for k, cb in self.subs if k != key]
+            self.holders.discard(key)
+            idle = not self.holders
+        if idle:
+            self._stop()
 
-    def route_headphones(self):
-        for n, v in HP_ROUTE:
-            self._amixer(["numid=%d" % n, v])
+    def _start(self):
+        with self.lock:
+            if self.running():
+                return True
+            if self.thread is not None and self.thread.is_alive():
+                return False
+            if not fm_source_present():
+                return False
+            try:
+                self.errf = open("/tmp/fm-radio-capture.err", "wb")
+                self.proc = subprocess.Popen(
+                    ["pw-record", "--target", FM_SOURCE,
+                     "--rate", str(REC_RATE), "--channels", str(REC_CHANNELS),
+                     "--format", "s16", "--media-category", "Capture", "-"],
+                    stdout=subprocess.PIPE, stderr=self.errf)
+            except Exception:
+                self.proc = None
+                return False
+            # pw-record exiting is not the only failure: it keeps running when
+            # the target is gone, so check the node again once the stream has
+            # had time to link.
+            time.sleep(0.3)
+            if self.proc.poll() is not None or not fm_source_present():
+                self.proc.terminate()
+                self.proc = None
+                return False
+            self.thread = threading.Thread(target=self._pump, daemon=True)
+            self.thread.start()
+            return True
 
-    def route_off(self):
-        # Silence both local outputs while FM is routed to Bluetooth.
-        for n in (6, 162, 163, 164, 165):
-            self._amixer(["numid=%d" % n, "off"])
+    def _stop(self):
+        p, self.proc = self.proc, None
+        t, self.thread = self.thread, None
+        if p is not None and p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                p.kill()
+        if t is not None and t.is_alive():
+            t.join(timeout=3)
+        f, self.errf = self.errf, None
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
 
-    def mic_path_on(self):
-        for name, v in MIC_ROUTE:
-            self._amixer(["name=%s" % name, v])
+    def _pump(self):
+        frame = 2 * REC_CHANNELS
+        chunk = self.CHUNK - (self.CHUNK % frame)
+        proc = self.proc
+        while True:
+            try:
+                data = proc.stdout.read(chunk)
+            except Exception:
+                break
+            if not data:
+                break
+            with self.lock:
+                subs = list(self.subs)
+            for _, cb in subs:
+                try:
+                    cb(data)
+                except Exception:
+                    pass
+        with self.lock:
+            if self.proc is proc:
+                self.proc = None
+                self.thread = None
+
+
+STREAM = FmStream()
+
+
+class Player:
+    PLAY_CHUNKS = 64
+
+    def __init__(self):
+        self.sink = local_sink()
+        self.target = "headphones"
+        self.play_proc = None
+        self.play_thread = None
+        self.play_q = None
 
     def _sinks(self):
         return list_sinks()
-
-    def _sources(self):
-        r = pactl("list", "short", "sources")
-        names = []
-        for line in (r.stdout if r else "").splitlines():
-            parts = line.split("\t")
-            if len(parts) >= 2:
-                names.append(parts[1])
-        return names
 
     def _card_profile(self, card):
         r = pactl("list", "cards")
@@ -444,15 +537,49 @@ class Player:
                 return s.split(":", 1)[1].strip()
         return None
 
-    def _ensure_profile(self):
-        if SINK_LOCAL in self._sinks() and SRC in self._sources():
-            return True
-        pactl("set-card-profile", CARD, PROFILE)
+    def _card_profiles(self, card):
+        r = pactl("list", "cards")
+        out = []
+        inside = False
+        listing = False
+        for line in (r.stdout if r else "").splitlines():
+            s = line.strip()
+            if s.startswith("Name: "):
+                inside = (s[6:] == card)
+                listing = False
+            elif inside and s == "Profiles:":
+                listing = True
+            elif inside and listing:
+                if s.startswith("Active Profile:") or s.startswith("Ports:"):
+                    break
+                if ": " in s:
+                    out.append(s.split(": ", 1)[0])
+        return out
+
+    def _ensure_profile(self, target):
+        """Switch the card to the profile whose output is the wanted one.
+
+        Under UCM every output device is its own profile, so speaker vs
+        headphones is a card-profile choice. The codec routing is done by the
+        UCM device sequences; this program only selects.
+        """
+        want = "Speaker" if target == "speaker" else "Headphones"
+        current = self._card_profile(CARD) or ""
+        cur_in = "HeadsetMic" if "HeadsetMic" in current else "IntMic"
+        profiles = [p for p in self._card_profiles(CARD)
+                    if p.startswith("HiFi") and want in p]
+        same_in = [p for p in profiles if cur_in in p]
+        chosen = (same_in or profiles or [None])[0]
+        if chosen is None:
+            return None
+        if current != chosen:
+            pactl("set-card-profile", CARD, chosen)
         for _ in range(40):
-            if SINK_LOCAL in self._sinks() and SRC in self._sources():
-                return True
+            sink = local_sink()
+            if sink and want in sink:
+                return sink
             time.sleep(0.1)
-        return False
+        return None
 
     @staticmethod
     def _bt_card(sink):
@@ -477,28 +604,29 @@ class Player:
         the system volume feeds another device and what is being heard stays
         where it was.
         """
+        if not sink:
+            return
         r = pactl("get-default-sink")
         if r and r.returncode == 0 and (r.stdout or "").strip() == sink:
             return
         pactl("set-default-sink", sink)
 
     def prepare(self, target):
-        """Make the wanted output usable for FM; returns the sink target or None."""
-        if not self._ensure_profile():
-            return None
-        self.mic_path_on()
-        if target == "headphones":
-            self.route_headphones()
-            self.sink = SINK_LOCAL
-            self.own_default_sink(SINK_LOCAL)
-            return "headphones"
-        if target == "speaker":
-            self.route_speaker()
-            self.sink = SINK_LOCAL
-            self.own_default_sink(SINK_LOCAL)
-            return "speaker"
+        """Make the wanted output usable for FM; returns the sink target or None.
+
+        Speaker and headphones are the same PipeWire sink, but not the same
+        analog path: the codec drives HPO for headphones and AIF2/TFA9890 for
+        the speakers, and the plug stays in as the antenna.
+        """
+        if target in ("headphones", "speaker"):
+            sink = self._ensure_profile(target)
+            if not sink:
+                return None
+            self.sink = sink
+            self.target = target
+            self.own_default_sink(sink)
+            return target
         if target.startswith(BT_PREFIX):
-            self.route_off()
             sink = self._resolve_bt_sink(target)
             card = self._bt_card(sink)
             profile = self._card_profile(card) or ""
@@ -539,14 +667,6 @@ class Player:
         if self.sink:
             pactl("set-sink-mute", self.sink, "1" if muted else "0")
 
-    def _loopback_ids(self):
-        ids = []
-        r = pactl("list", "short", "modules")
-        for line in (r.stdout if r else "").splitlines():
-            if "module-loopback" in line and "sof_cht_rt5659" in line:
-                ids.append(line.split()[0])
-        return ids
-
     def _sink_index(self, sink):
         r = pactl("list", "short", "sinks")
         for line in (r.stdout if r else "").splitlines():
@@ -571,17 +691,90 @@ class Player:
                 return parts[-1]
         return None
 
-    def loopback_alive(self):
-        if not self.loop_id:
-            return False
-        r = pactl("list", "short", "modules")
-        found = False
-        for line in (r.stdout or "").splitlines():
-            parts = line.split()
-            if parts and parts[0] == str(self.loop_id):
-                found = True
+    def _feed_playback(self, chunk):
+        """Called on the pump thread: never block it, drop instead.
+
+        Radio has no use for a backlog - if the sink stalls, the newest audio
+        is the one worth keeping.
+        """
+        q = self.play_q
+        if q is None:
+            return
+        try:
+            q.put_nowait(chunk)
+        except queue.Full:
+            try:
+                q.get_nowait()
+                q.put_nowait(chunk)
+            except (queue.Empty, queue.Full):
+                pass
+
+    def _drain_playback(self):
+        q, proc = self.play_q, self.play_proc
+        while True:
+            try:
+                chunk = q.get(timeout=5)
+            except queue.Empty:
+                continue
+            if chunk is None:
                 break
-        if not found:
+            try:
+                proc.stdin.write(chunk)
+                proc.stdin.flush()
+            except Exception:
+                break
+
+    def loopback_on(self):
+        self.loopback_off()
+        if not self.sink or not STREAM.attach("play", self._feed_playback):
+            return None
+        # aplay binds to whatever is the default the moment it opens
+        self.own_default_sink(self.sink)
+        try:
+            self.play_proc = subprocess.Popen(
+                ["aplay", "-D", "default", "-q", "-f", "S16_LE",
+                 "-c", str(REC_CHANNELS), "-r", str(REC_RATE), "-"],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+        except Exception:
+            self.play_proc = None
+            STREAM.detach("play")
+            return None
+        self.play_q = queue.Queue(maxsize=self.PLAY_CHUNKS)
+        self.play_thread = threading.Thread(target=self._drain_playback,
+                                            daemon=True)
+        self.play_thread.start()
+        # A pipewire client only appears as a sink-input once audio flows, so
+        # an empty list here is not proof of failure - it is exactly what a
+        # dead capture stream looks like. Judge by the processes, and take the
+        # node as confirmation when it does show up.
+        for _ in range(20):
+            time.sleep(0.15)
+            if self.play_proc.poll() is not None or not STREAM.running():
+                break
+            idx = self._sink_index(self.sink)
+            if idx and self._has_sink_input(idx):
+                return "fm-pipe"
+        if self.play_proc.poll() is None and STREAM.running():
+            return "fm-pipe"
+        self.loopback_off()
+        return None
+
+    def refresh_local_sink(self):
+        """Re-resolve the board sink after a jack change swapped UCM devices."""
+        if self.sink and self.sink.startswith(LOCAL_PREFIX):
+            live = local_sink()
+            if live and live != self.sink:
+                self.sink = live
+        return self.sink
+
+    def loopback_alive(self):
+        self.refresh_local_sink()
+        if self.play_proc is None or not STREAM.running():
+            return False
+        if self.play_proc.poll() is not None:
+            return False
+        if not fm_source_present():
             return False
         state = self._sink_state(self.sink)
         if self.sink.startswith(BT_PREFIX) and state == "SUSPENDED":
@@ -589,69 +782,76 @@ class Player:
         idx = self._sink_index(self.sink)
         return idx is not None and self._has_sink_input(idx)
 
-    def loopback_on(self):
-        self.loopback_off()
-        if not self.sink:
-            return None
-        for _ in range(2):
-            if self.sink.startswith(BT_PREFIX):
-                self.sink = self._resolve_bt_sink(self.sink)
-            r = pactl("load-module", "module-loopback",
-                      "source=" + SRC, "sink=" + self.sink,
-                      "latency_msec=80", timeout=15)
-            self.loop_id = (r.stdout.strip() if r and r.returncode == 0 else None) or None
-            if self.loop_id:
-                time.sleep(0.15)
-                idx = self._sink_index(self.sink)
-                if idx and self._has_sink_input(idx):
-                    return self.loop_id
-            self.loopback_off()
-            time.sleep(0.2)
-        return None
-
     def loopback_off(self):
-        for i in self._loopback_ids():
-            pactl("unload-module", i)
-        self.loop_id = None
+        q, self.play_q = self.play_q, None
+        t, self.play_thread = self.play_thread, None
+        p, self.play_proc = self.play_proc, None
+        if q is not None:
+            try:
+                q.put_nowait(None)
+            except queue.Full:
+                pass
+        if t is not None and t.is_alive():
+            t.join(timeout=2)
+        if p is not None:
+            try:
+                if p.stdin:
+                    p.stdin.close()
+            except Exception:
+                pass
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+        STREAM.detach("play")
 
 
 class Recorder:
-    """Capture the FM stream to a WAV file straight from the ALSA source.
+    """Capture the FM stream to a WAV file straight off the ALSA reader.
 
-    Recording taps the capture node directly, so it does not depend on the
-    output routing: it keeps running while the radio is muted, routed to
-    Bluetooth, or not being listened to at all.
+    Recording taps the stream, not the output routing: it keeps running while
+    the radio is muted, routed to Bluetooth, or not being listened to at all.
     """
 
     def __init__(self):
-        self.proc = None
+        self.wav = None
         self.path = None
         self.started = 0.0
         self.minutes = 0
 
     def running(self):
-        return self.proc is not None and self.proc.poll() is None
+        return self.wav is not None and STREAM.running()
+
+    def _write(self, chunk):
+        self.wav.writeframesraw(chunk)
 
     def begin(self, path, minutes):
+        try:
+            w = wave.open(path, "wb")
+        except Exception:
+            return
+        w.setnchannels(REC_CHANNELS)
+        w.setsampwidth(2)
+        w.setframerate(REC_RATE)
+        if not STREAM.attach("rec", self._write):
+            w.close()
+            return
+        self.wav = w
         self.path = path
         self.started = time.time()
         self.minutes = minutes
-        self.proc = subprocess.Popen(
-            ["parecord", "--device=" + SRC, "--format=s16le",
-             "--rate=%d" % REC_RATE, "--channels=%d" % REC_CHANNELS,
-             "--file-format=wav", path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def end(self):
-        p, self.proc = self.proc, None
-        if p is not None and p.poll() is None:
-            p.terminate()
-            try:
-                p.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                p.kill()
-                p.wait()
+        w, self.wav = self.wav, None
         path, self.path = self.path, None
+        if w is not None:
+            try:
+                w.close()
+            except Exception:
+                pass
+        STREAM.detach("rec")
         return path
 
 
@@ -662,8 +862,7 @@ class Spectrum(threading.Thread):
 
     def __init__(self):
         super().__init__(daemon=True)
-        self.stop_flag = threading.Event()
-        self.proc = None
+        self.key = "spectrum-%d" % id(self)
         self.buf = bytearray()
         self.lock = threading.Lock()
         self.bars = [0.0] * self.BANDS
@@ -698,30 +897,21 @@ class Spectrum(threading.Thread):
         return a
 
     def run(self):
-        try:
-            self.proc = subprocess.Popen(
-                ["parec", "--raw", "--format=s16le", "--rate=48000",
-                 "--channels=1", "--latency-msec=40", "--device=" + SRC],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        except Exception:
-            self.proc = None
-            return
-        while not self.stop_flag.is_set():
-            chunk = self.proc.stdout.read(8192)
-            if not chunk:
-                break
-            with self.lock:
-                self.buf.extend(chunk)
-                if len(self.buf) > self.N * 16:
-                    del self.buf[:-self.N * 16]
+        STREAM.attach(self.key, self._feed, hold=False)
+
+    def _feed(self, chunk):
+        if REC_CHANNELS > 1:
+            samples = array.array("h")
+            samples.frombytes(chunk)
+            # the tuner is mono, the FW only copies it into both slots
+            chunk = samples[0::REC_CHANNELS].tobytes()
+        with self.lock:
+            self.buf.extend(chunk)
+            if len(self.buf) > self.N * 16:
+                del self.buf[:-self.N * 16]
 
     def stop(self):
-        self.stop_flag.set()
-        if self.proc:
-            try:
-                self.proc.terminate()
-            except Exception:
-                pass
+        STREAM.detach(self.key)
 
     def update(self):
         with self.lock:
@@ -1527,8 +1717,9 @@ class App(Gtk.Window):
             self._start_output_switch(target)
         else:
             self.output = target
-            self.player.sink = sink_for(target)
-            self.player.own_default_sink(self.player.sink)
+            if self.player.prepare(target) is None:
+                self._set_status("输出不可用，请换一个输出")
+                return
             self.player.set_volume(self.volume)
             self._set_status("输出：%s" % self._output_label(target))
             self._save()
@@ -1559,8 +1750,6 @@ class App(Gtk.Window):
             ok = resolved is not None
             if ok:
                 final = resolved
-                if not final.startswith(BT_PREFIX):
-                    self.player.codec_path_on()
                 self.player.set_volume(self.volume)
                 loop_id = self.player.loopback_on()
                 if loop_id is None and final.startswith(BT_PREFIX):
@@ -1640,9 +1829,10 @@ class App(Gtk.Window):
 
         def work():
             self.fm.init()
-            if not self.output.startswith(BT_PREFIX):
-                self.player.codec_path_on()
             flag, rssi, snr = self.fm.tune(khz)
+            if self.playing:
+                # a retune drops the I2S route exactly like the first tune
+                self.fm.audio_on()
             self.player.set_volume(self.volume)
             GLib.idle_add(self._after_tune, flag, rssi, snr)
 
@@ -1693,21 +1883,26 @@ class App(Gtk.Window):
                 ok = resolved is not None
                 final = resolved if ok else target
                 self.fm.init()
-                if ok and not final.startswith(BT_PREFIX):
-                    self.player.codec_path_on()
                 flag, rssi, snr = self.fm.tune(khz)
+                loop_ok = False
                 if ok:
+                    # The chip drops the I2S route written inside the tune, so
+                    # the output stays digital silence until it is written
+                    # again after the lock; capture still looks perfectly
+                    # healthy in that state.
+                    self.fm.audio_on()
                     self.player.set_volume(self.volume)
-                    self.player.loopback_on()
+                    loop_ok = self.player.loopback_on() is not None
             if ok:
                 GLib.timeout_add(1200, self._reassert_volume, final)
                 self.spec = Spectrum()
                 self.spec.start()
-            GLib.idle_add(self._after_start, flag, rssi, snr, final, ok)
+            GLib.idle_add(self._after_start, flag, rssi, snr, final,
+                          ok, loop_ok)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _after_start(self, flag, rssi, snr, final, ok):
+    def _after_start(self, flag, rssi, snr, final, ok, loop_ok=True):
         self.playing = True
         self._set_busy(False)
         self._out_failed = not ok
@@ -1721,6 +1916,8 @@ class App(Gtk.Window):
             self._set_status("调谐失败（%.1f MHz）" % self.current)
         elif not ok:
             self._set_status("正在收听，但输出不可用")
+        elif not loop_ok:
+            self._set_status("正在收听，但采集源打不开（%s）" % FM_SOURCE)
         else:
             dbu = self.fm.rssi_dbu(rssi)
             extra = " · SNR %d" % snr if snr is not None else ""
@@ -1745,7 +1942,6 @@ class App(Gtk.Window):
             self.player.loopback_off()
             self.fm.off()
         self.player.set_mute(False)
-        self.player.route_off()
         self._clear_active()
         self.progress.hide()
         self.scan_btn.set_sensitive(True)
@@ -1773,7 +1969,6 @@ class App(Gtk.Window):
             if not self.rec.running():
                 self.fm.off()
         self.player.set_mute(False)
-        self.player.route_off()
         self._clear_active()
         self._render_spectrum()
         self._set_status("已静音（录音继续）" if self.rec.running() else "已停止")
@@ -1788,8 +1983,6 @@ class App(Gtk.Window):
             return False
         if self.playing:
             with self._audio_lock:
-                if not self.player.sink.startswith(BT_PREFIX):
-                    self.player.codec_path_on()
                 self.player.set_volume(self.volume)
             return False
         target = self.output
@@ -1800,8 +1993,6 @@ class App(Gtk.Window):
         if resolved is None or self._cancel.is_set():
             return False
         with self._audio_lock:
-            if not resolved.startswith(BT_PREFIX):
-                self.player.codec_path_on()
             self.player.set_volume(self.volume)
             self.player.loopback_on()
         if self._cancel.is_set():
@@ -2213,7 +2404,6 @@ class App(Gtk.Window):
                 with self._audio_lock:
                     self.fm.off()
                 self.player.set_mute(False)
-                self.player.route_off()
         self.rec_btn.set_label("● 立即录音")
         self._refresh_recordings()
         if path and os.path.exists(path):
@@ -2237,7 +2427,7 @@ class App(Gtk.Window):
             else:
                 self.rec_status.set_text("%s / %s" % (fmt_dur(elapsed),
                                                       fmt_dur(total)))
-        elif self.rec.proc is not None:
+        elif self.rec.wav is not None:
             self._stop_recording(note="录音已中断")
         else:
             self.rec_status.set_text("")
@@ -2326,8 +2516,10 @@ class App(Gtk.Window):
         self._stop_playback()
         if self.playing:
             self._stop_play()
+        self.player.refresh_local_sink()
         if not self.player.sink:
-            self.player.sink = SINK_LOCAL
+            self._set_status("输出不可用，请检查音频设备")
+            return
         self.player.set_volume(self.volume)
         self._play_proc = subprocess.Popen(
             ["paplay", "--device=" + self.player.sink, path],
@@ -2426,8 +2618,8 @@ class App(Gtk.Window):
                     self._out_suppress = True
                     self.out_combo.set_active_id(target)
                     self._out_suppress = False
-                    self.player.sink = sink_for(target)
-                    self.player.own_default_sink(self.player.sink)
+                    if self.player.prepare(target) is None:
+                        return {"ok": False, "error": "output unavailable"}
                     self.player.set_volume(self.volume)
                     self._save()
                 return {"ok": True, "output": target}
@@ -2601,7 +2793,6 @@ class App(Gtk.Window):
                 self.player.loopback_off()
                 self.fm.off()
                 time.sleep(0.1)
-            self.player.route_off()
         except Exception:
             pass
         self._clear_active()

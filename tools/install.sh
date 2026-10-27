@@ -18,10 +18,13 @@ install -d "$bindir" "$tplgdir" /usr/share/applications /etc/systemd/user \
 install -m 755 "$here/fm-radio" "$bindir/fm-radio"
 install -m 755 "$here/fm-listen.sh" "$bindir/fm-listen.sh"
 install -m 755 "$here/latte-jack-switch" "$bindir/latte-jack-switch"
+install -m 755 "$here/fm-tuner" "$bindir/fm-tuner"
+install -m 755 "$here/fm-sst" "$bindir/fm-sst"
 install -m 644 "$here/fm-radio.desktop" /usr/share/applications/fm-radio.desktop
 install -m 644 "$here/fm-radio-autostart.desktop" \
 	/etc/xdg/autostart/fm-radio.desktop
 install -m 644 "$here/latte-jack-switch.service" /etc/systemd/user/latte-jack-switch.service
+install -m 644 "$here/fm-tuner.service" /etc/systemd/user/fm-tuner.service
 
 install -m 644 "$here/../sof/sof-cht-rt5659.tplg" "$tplgdir/sof-cht-rt5659.tplg"
 
@@ -38,10 +41,10 @@ python3 -c 'import gi; gi.require_version("Gtk", "3.0")' 2>/dev/null ||
 cat <<'EOF'
 
 Installed:
-  /usr/local/bin/{hci_fm,fm-radio,fm-listen.sh,latte-jack-switch}
+  /usr/local/bin/{hci_fm,fm-radio,fm-listen.sh,latte-jack-switch,fm-tuner,fm-sst}
   /usr/share/applications/fm-radio.desktop
   /etc/xdg/autostart/fm-radio.desktop
-  /etc/systemd/user/latte-jack-switch.service
+  /etc/systemd/user/{latte-jack-switch,fm-tuner}.service
   /lib/firmware/intel/sof-tplg/sof-cht-rt5659.tplg
 
 Still required:
@@ -49,4 +52,6 @@ Still required:
   2. sof-cht.ri v2.2 at /lib/firmware/intel/sof/sof-cht.ri.
   3. Passwordless sudo for hci_fm and amixer for the desktop user.
   4. Enable the jack daemon:  systemctl --user enable --now latte-jack-switch
+  5. SST route only: enable the tuner service, which owns the chip and publishes
+     the fm_radio source:  systemctl --user enable --now fm-tuner
 EOF

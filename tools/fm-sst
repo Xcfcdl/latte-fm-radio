@@ -1,0 +1,255 @@
+#!/bin/bash
+# fm-sst — 诊断/扫描工具，作为系统层 fm-tuner 服务的客户端。
+#
+# 芯片（HCI 上电、调谐、采集 PCM）由 fm-tuner 独占；这里不再直接调 hci_fm，
+# 也不直接开 hw:$CARD,$CAP_DEV —— 那会和常驻的 fm_radio 源抢同一个 PCM。
+# 播放走 fm_radio 这个 PipeWire 源。
+set -u
+
+P=/sys/module/snd_soc_sst_atom_hifi2_platform/parameters
+CARD=${CARD:-0}
+# 几何参数要写 sysfs -> 用 sudo 跑；但 tuner/pactl 属于登录用户，按 SUDO_UID 找回
+U=${SUDO_UID:-$(id -u)}
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$U}
+export DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$U/bus}
+SOCK=$XDG_RUNTIME_DIR/fm-tuner.sock
+# hw:0,0 被 PipeWire 常驻占用，实时收听走 pipewire
+PB_DEV=${PB_DEV:-default}
+SINK=${SINK:-$(pactl get-default-sink 2>/dev/null)}
+STATE=/tmp/fm-sst.state
+PID=/tmp/fm-sst.play.pid
+
+cs()  { amixer -c $CARD cset name="$1" "$2" >/dev/null 2>&1; }
+die() { echo "fm-sst: $*" >&2; exit 1; }
+
+have_tuner() { [ -S "$SOCK" ]; }
+
+# 一次 JSON 请求；数值参数写成 k=v，data=1,2,3 会自动变成整数列表
+tk() {
+  python3 - "$SOCK" "$@" <<'PY'
+import json, socket, sys
+path, req = sys.argv[1], {"cmd": sys.argv[2]}
+for a in sys.argv[3:]:
+    k, v = a.split("=", 1)
+    if k == "data":
+        req[k] = [int(x, 0) for x in v.split(",")]
+        continue
+    for conv in (lambda s: int(s, 0), float):
+        try:
+            req[k] = conv(v)
+            break
+        except ValueError:
+            pass
+    else:
+        req[k] = v
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(120)
+s.connect(path)
+s.sendall((json.dumps(req) + "\n").encode())
+buf = b""
+while not buf.endswith(b"\n"):
+    d = s.recv(65536)
+    if not d:
+        break
+    buf += d
+s.close()
+rep = json.loads(buf.decode() or "{}")
+sys.stdout.write(json.dumps(rep.get("result") if rep.get("ok") else None))
+PY
+}
+
+usage() {
+  cat <<EOF
+fm-sst — FM on SST (hw:$CARD, FW 侧由 fm-tuner 服务独占芯片)
+  fm-sst on <MHz>            power chip + tune (no audio out)
+  fm-sst play [MHz] [vol]    loop the fm_radio source to the current sink
+  fm-sst stop                stop playback
+  fm-sst off                 standby the chip
+  fm-sst scan [lo hi step]   band scan, report locked stations by RSSI  (default 87.5 108.0 0.1)
+  fm-sst fine <MHz> [span]   fine sweep around a station to find the peak
+  fm-sst meter               lock / RSSI / SNR of the current frequency
+EOF
+}
+
+# ---- the geometry that actually decodes (SST FW ignores 20-bit slots) ----
+apply_geometry() {
+  [ -w $P/btfm_bits ] || die "no $P — is snd_soc_sst_atom_hifi2_platform loaded with the BTFM DAI?"
+  echo 2 > $P/btfm_sel        # sst_ssp_port_id: SSP_FM
+  echo 16 > $P/btfm_bits      # only 16-bit slots decode on SST
+  echo 2  > $P/btfm_slots
+  echo 3  > $P/btfm_map       # both slots active; slot 0 alone yields all zeros
+  echo 3  > $P/btfm_fsw       # frame sync width in clocks
+  echo 2  > $P/btfm_delay     # start delay
+  echo 1  > $P/btfm_duplex    # RX only
+  echo 0  > $P/btfm_mode      # provider (we clock the chip)
+  echo 1  > $P/btfm_proto     # I2S
+  echo 3  > $P/btfm_fsfreq    # 48 kHz
+  echo 0  > $P/btfm_dpol
+}
+
+# ---- firmware gains sit at -144 dB out of the box; without this you get silence ----
+apply_fmgain() {
+  cs 'pcm2_out mix 0 fm_in Switch' 1
+  cs 'fm_in Gain 0 Switch' 1
+  cs 'pcm2_out Gain 0 Switch' 1
+  cs 'fm_in Gain 0 Volume' '-180,-180'
+  cs 'pcm2_out Gain 0 Volume' '0,0'
+}
+
+chip_on() {
+  have_tuner || die "fm-tuner 没在跑（$SOCK 不存在）：先 systemctl --user start fm-tuner"
+  apply_geometry; apply_fmgain
+  [ "$(tk init)" = "true" ] || die "tuner init 失败"
+}
+
+# 电平/SNR 只能在音频路由写完之后读
+show_state() {
+  python3 - "$SOCK" <<'PY'
+import json, socket, sys
+
+def call(**req):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(30)
+    s.connect(sys.argv[1])
+    s.sendall((json.dumps(req) + "\n").encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        d = s.recv(65536)
+        if not d:
+            break
+        buf += d
+    s.close()
+    rep = json.loads(buf.decode() or "{}")
+    return rep.get("result") if rep.get("ok") else None
+
+st, rs, sn = (call(cmd="read", reg=r, n=1) for r in (0x12, 0x0F, 0xDF))
+if not isinstance(st, int):
+    print("lock=? rssi=? snr=?")
+    raise SystemExit(1)
+print("lock=%d rssi=%d snr=%s" % (
+    st & 3,
+    (rs if isinstance(rs, int) else 0) & 0x7f,
+    sn if isinstance(sn, int) else "?"))
+PY
+}
+
+khz_of() { # accepts 92.4 | 92400 | 9240
+  case "$1" in
+    *.*) echo $(awk -v v="$1" 'BEGIN{printf "%d", v*1000 + 0.5}') ;;
+    *)   if [ "$1" -gt 1080 ]; then echo "$1"; else echo $((100 * $1)); fi ;;
+  esac
+}
+
+mhz_of() { echo "$(( $1 / 1000 )).$(( $1 % 1000 / 10 ))"; }
+
+fm_source_present() { pactl list short sources 2>/dev/null | grep -q "fm_radio"; }
+
+cmd_play() {
+  local khz=${1:-} vol=${2:-} dur=${3:-}
+  have_tuner || die "fm-tuner 没在跑（$SOCK 不存在）"
+  [ -f $STATE ] || die "no station tuned; run: fm-sst on <MHz>"
+  if [ -n "$khz" ]; then khz=$(khz_of "$khz"); else khz=$(cat $STATE); fi
+  if ! fm_source_present; then
+    [ "$(tk audio_on)" = "true" ] || true
+    sleep 0.5
+  fi
+  fm_source_present || die "fm_radio 源没起来（tuner 侧 create-node 失败）"
+  [ -n "$vol" ] && cs 'Headphone Playback Volume' "$vol,$vol"
+  stop_playback
+  pw-record --target fm_radio --rate 48000 --channels 2 --format s16 - 2>/tmp/fm-sst.err \
+    | aplay -D "$PB_DEV" -f S16_LE -c 2 -r 48000 - 2>>/tmp/fm-sst.err &
+  echo $! > $PID
+  sleep 1
+  if ! kill -0 "$(cat $PID)" 2>/dev/null; then
+    echo "fm-sst: 输出起不来 —— $(tail -2 /tmp/fm-sst.err | tr "\n" " ")" >&2; exit 1
+  fi
+  echo "playing $(mhz_of $khz) MHz  src=fm_radio out=$PB_DEV  (pid $(cat $PID))"
+}
+
+stop_playback() {
+  [ -f $PID ] || return 0
+  local p=$(cat $PID)
+  if kill -0 "$p" 2>/dev/null; then pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; fi
+  rm -f $PID
+  pkill -f "pw-record --target fm_radio" 2>/dev/null
+  return 0
+}
+
+# 扫描在 python 里一次做完：每步一次 tune_wait，避免 200 次进程启动。
+# tune_wait 返回 [flag, rssi, snr]，flag&3 == 1 才算锁上。
+band_sweep() { # lo hi step settle top [decimals]
+  python3 - "$SOCK" "$1" "$2" "$3" "$4" "$5" "${6:-1}" <<'PY'
+import json, socket, sys
+
+path, lo, hi, step, settle, top, dec = (
+    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]),
+    float(sys.argv[5]), int(sys.argv[6]), int(sys.argv[7]))
+
+def call(**req):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(60)
+    s.connect(path)
+    s.sendall((json.dumps(req) + "\n").encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        d = s.recv(65536)
+        if not d:
+            break
+        buf += d
+    s.close()
+    rep = json.loads(buf.decode() or "{}")
+    return rep.get("result") if rep.get("ok") else None
+
+rows = []
+for khz in range(lo, hi + 1, step):
+    r = call(cmd="tune_wait", khz=khz, timeout=0.9, settle=settle)
+    if not isinstance(r, list) or len(r) != 3 or r[0] is None:
+        continue
+    flag, rssi, snr = r
+    if (flag & 3) != 1 or rssi is None:
+        continue
+    rows.append((rssi & 0x7f, -1 if snr is None else snr, khz, flag & 3))
+
+rows.sort(reverse=True)
+for rssi, snr, khz, _ in rows[:top]:
+    print("%*.*f  rssi=%3d snr=%3d" % (5 + dec, dec, khz / 1000.0, rssi, snr))
+PY
+}
+
+cmd_scan() {
+  local lo=$(khz_of "${1:-87.5}") hi=$(khz_of "${2:-108.0}") st=$(khz_of "${3:-0.1}")
+  have_tuner || die "fm-tuner 没在跑（$SOCK 不存在）"
+  chip_on
+  band_sweep $lo $hi $st 0.6 12
+}
+
+cmd_fine() {
+  local c=$(khz_of "$1") span=$(khz_of "${2:-0.06}")
+  have_tuner || die "fm-tuner 没在跑（$SOCK 不存在）"
+  chip_on
+  band_sweep $((c - span)) $((c + span)) 20 0.8 8 2
+}
+
+case "${1:-}" in
+  on)
+    [ $# -ge 2 ] || { usage; exit 1; }
+    K=$(khz_of "$2")
+    chip_on
+    tk tune khz=$K settle=0.85 >/dev/null
+    echo "$K" > $STATE
+    sleep 0.3
+    echo "tuned $(mhz_of $K) MHz  $(show_state)"
+    ;;
+  play) shift; cmd_play "${1:-}" "${2:-}" "${3:-}" ;;
+  stop) stop_playback; echo "stopped" ;;
+  off)
+    stop_playback
+    have_tuner && tk off >/dev/null
+    rm -f $STATE
+    echo "chip standby"
+    ;;
+  scan) shift; cmd_scan "$@" ;;
+  fine) shift; cmd_fine "$@" ;;
+  meter) [ -f $STATE ] && echo "$(mhz_of $(cat $STATE)) MHz $(show_state)" || die "not tuned" ;;
+  *) usage; exit 1 ;;
+esac

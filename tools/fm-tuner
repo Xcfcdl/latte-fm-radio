@@ -1,0 +1,327 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Xcfcdl <746953609@qq.com>
+"""fm-tuner — system-layer owner of the BCM4356 FM tuner.
+
+The chip is a shared resource: it needs an HCI power-up and tuning sequence
+before the SST pipe carries audio, and only one process can hold it. This
+service owns that, and publishes the captured stream as the PipeWire source
+"fm_radio", so any application can record the radio and the loudspeaker /
+headphone choice stays a system setting.
+
+Protocol: one JSON object per line on $XDG_RUNTIME_DIR/fm-tuner.sock.
+  {"cmd": "init", "rds": false}          -> true
+  {"cmd": "off"}                         -> true
+  {"cmd": "tune", "khz": 92400}          -> [flag, rssi, snr]
+  {"cmd": "tune_wait", "khz": 92400}     -> [flag, rssi, snr]
+  {"cmd": "audio_on"}                    -> true
+  {"cmd": "status"}                      -> {powered, source, flag, rssi, snr}
+  {"cmd": "read", "reg": 18, "n": 1}     -> int
+  {"cmd": "write", "reg": 10, "val": 1}  -> true
+  {"cmd": "raw", "data": [0, 0, 1]}      -> true
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+HCI = "/usr/local/bin/hci_fm"
+SOURCE = "fm_radio"
+BTFM_PARAM = ("/sys/module/snd_soc_sst_atom_hifi2_platform"
+              "/parameters/btfm_pcm_dev")
+RUN_DIR = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+SOCK_PATH = os.path.join(RUN_DIR, "fm-tuner.sock")
+
+NODE_PROPS = """{
+  factory.name = "api.alsa.pcm.source"
+  node.name = "%(name)s"
+  node.description = "FM Radio"
+  media.class = "Audio/Source"
+  object.linger = true
+  api.alsa.path = "%(path)s"
+  audio.format = "S16LE"
+  audio.rate = 48000
+  audio.channels = 2
+  audio.position = [ FL FR ]
+}"""
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def fm_pcm():
+    """ALSA device of the FM pipe; the dailink index moves with the board."""
+    try:
+        with open(BTFM_PARAM) as f:
+            return "hw:0,%s" % f.read().strip()
+    except OSError:
+        return "hw:0,6"
+
+
+def node_ids():
+    try:
+        out = subprocess.run(["pw-dump"], capture_output=True, text=True,
+                             timeout=15).stdout
+        dump = json.loads(out)
+    except Exception:
+        return []
+    ids = []
+    for obj in dump:
+        if obj.get("type") != "PipeWire:Interface:Node":
+            continue
+        props = (obj.get("info") or {}).get("props") or {}
+        if props.get("node.name") == SOURCE:
+            ids.append(obj["id"])
+    return ids
+
+
+def create_node():
+    if node_ids():
+        return True
+    props = NODE_PROPS % {"name": SOURCE, "path": fm_pcm()}
+    r = subprocess.run(["pw-cli", "create-node", "adapter", props],
+                       capture_output=True, text=True, timeout=20)
+    for _ in range(30):
+        if node_ids():
+            return True
+        time.sleep(0.1)
+    log("create-node failed: %s %s" % (r.stdout.strip(), r.stderr.strip()))
+    return False
+
+
+def destroy_node():
+    for nid in node_ids():
+        subprocess.run(["pw-cli", "destroy", str(nid)],
+                       capture_output=True, timeout=15)
+
+
+def stream_has_audio(seconds=0.4):
+    """True when the published source is carrying non-zero samples.
+
+    The FM PCM sometimes comes up delivering exact zeros - the stream is
+    opened before the chip's I2S output is armed - and stays that way until
+    it is reopened.
+    """
+    try:
+        subprocess.run(["pw-record", "--target", SOURCE, "--rate", "48000",
+                        "--channels", "2", "--format", "s16", "-"],
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                       timeout=seconds)
+        return False
+    except subprocess.TimeoutExpired as e:
+        data = e.stdout or b""
+    except Exception:
+        return False
+    return any(data)
+
+
+def create_node_with_audio(tries=2):
+    for _ in range(tries):
+        if not create_node():
+            return False
+        if stream_has_audio():
+            return True
+        log("source is silent, reopening")
+        destroy_node()
+    return create_node()
+
+
+class Chip:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.powered = False
+
+    def _hci(self, args):
+        try:
+            r = subprocess.run(["sudo", "-n", HCI] + [str(a) for a in args],
+                               capture_output=True, text=True, timeout=15)
+        except Exception as e:
+            log("hci %s: %s" % (args, e))
+            return None
+        if r.returncode != 0:
+            log("hci %s: %s" % (args, r.stderr.strip()))
+            return None
+        out = r.stdout.split()
+        return out[1:] if out and out[0] == "OK" else None
+
+    def write(self, reg, val):
+        return self._hci(["write", hex(int(reg)), str(int(val))]) is not None
+
+    def raw(self, *data):
+        return self._hci(["raw"] + [hex(int(d)) for d in data]) is not None
+
+    def vsc(self, *data):
+        return self._hci(["vsc"] + [hex(int(d)) for d in data]) is not None
+
+    def read(self, reg, n=1):
+        out = self._hci(["read", hex(int(reg)), str(int(n))])
+        if not out:
+            return None
+        try:
+            if n == 2 and len(out) >= 2:
+                return int(out[1] + out[0], 16)
+            return int(out[0], 16)
+        except ValueError:
+            return None
+
+    def read_raw(self, reg, n):
+        """Bytes as printed by hci_fm; the RDS FIFO is read in bulk."""
+        return self._hci(["read", hex(int(reg)), str(int(n))])
+
+    def init(self, rds=False):
+        with self.lock:
+            if not self.raw(0x00, 0x00, 0x03 if rds else 0x01):
+                return False
+            self.raw(0xFB, 0x00, 0xE0, 0xAB, 0xE0, 0x2E)
+            self.write(0x01, 0x0003)            # west band + stereo
+            # 0xFF lets the chip's 16-bit output wrap on programme peaks,
+            # audible as a click at any downstream volume.
+            self.write(0xF8, 0x00A0)
+            if rds:
+                self.raw(0x02, 0x00, 0x02)      # flush RDS FIFO
+                self.raw(0x02, 0x00, 0x00)      # RDS (not RBDS)
+                self.raw(0x14, 0x00, 0x04)      # FIFO waterline
+            self.powered = True
+        return create_node_with_audio()
+
+    def off(self):
+        with self.lock:
+            destroy_node()
+            self.raw(0x00, 0x00, 0x00)
+            self.powered = False
+        return True
+
+    def audio_on(self):
+        with self.lock:
+            self.write(0x05, 0x006C)            # I2S out, 75 us
+            self.vsc(0x61, 0x07, 0x19, 0x18, 0x19, 0x19)
+        return create_node_with_audio()
+
+    def tune(self, khz, settle=0.85):
+        with self.lock:
+            self.write(0x0A, khz - 64000)
+            self.raw(0x09, 0x00, 0x01)
+            time.sleep(settle)
+            self.write(0x05, 0x006C)
+            self.vsc(0x61, 0x07, 0x19, 0x18, 0x19, 0x19)
+        create_node_with_audio()
+        return [self.read(0x12, 1), self.read(0x0F, 1), self.read(0xDF, 1)]
+
+    def tune_wait(self, khz, timeout=0.8, settle=0.25):
+        """Tune and wait for usable signal meters.
+
+        The tune flag can still carry the previous result right after a
+        retune, and SNR needs about 0.2 s to reach its final value.
+        """
+        self.write(0x0A, khz - 64000)
+        self.raw(0x09, 0x00, 0x01)
+        deadline = time.time() + timeout
+        flag = None
+        while time.time() < deadline:
+            time.sleep(0.06)
+            flag = self.read(0x12, 1)
+            if flag is not None and (flag & 3) != 0:
+                break
+        if flag is None or (flag & 3) != 1:
+            return [flag, None, None]
+        time.sleep(settle)
+        flag = self.read(0x12, 1)
+        if flag is None or (flag & 3) != 1:
+            return [flag, None, None]
+        create_node_with_audio()
+        return [flag, self.read(0x0F, 1), self.read(0xDF, 1)]
+
+
+CHIP = Chip()
+
+
+def handle(req):
+    cmd = req.get("cmd")
+    if cmd == "init":
+        return CHIP.init(bool(req.get("rds")))
+    if cmd == "off":
+        return CHIP.off()
+    if cmd == "tune":
+        return CHIP.tune(int(req["khz"]), float(req.get("settle", 0.85)))
+    if cmd == "tune_wait":
+        return CHIP.tune_wait(int(req["khz"]), float(req.get("timeout", 0.8)),
+                              float(req.get("settle", 0.25)))
+    if cmd == "audio_on":
+        CHIP.audio_on()
+        return True
+    if cmd == "read":
+        return CHIP.read(int(req["reg"]), int(req.get("n", 1)))
+    if cmd == "read_raw":
+        return CHIP.read_raw(int(req["reg"]), int(req.get("n", 1)))
+    if cmd == "write":
+        return CHIP.write(int(req["reg"]), int(req["val"]))
+    if cmd == "raw":
+        return CHIP.raw(*[int(d) for d in req["data"]])
+    if cmd == "status":
+        flag = CHIP.read(0x12, 1)
+        return {
+            "powered": CHIP.powered,
+            "source": bool(node_ids()),
+            "flag": flag,
+            "rssi": CHIP.read(0x0F, 1) if flag is not None else None,
+            "snr": CHIP.read(0xDF, 1) if flag is not None else None,
+        }
+    raise KeyError("unknown command %r" % cmd)
+
+
+def serve(conn):
+    buf = b""
+    try:
+        while True:
+            data = conn.recv(65536)
+            if not data:
+                break
+            buf += data
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    rep = {"ok": True, "result": handle(json.loads(line.decode()))}
+                except Exception as e:
+                    rep = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+                    log("request failed: %s" % rep["error"])
+                conn.sendall((json.dumps(rep) + "\n").encode())
+    except Exception as e:
+        log("client gone: %s" % e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def main():
+    destroy_node()          # leftovers from a previous run
+    try:
+        os.unlink(SOCK_PATH)
+    except FileNotFoundError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCK_PATH)
+    os.chmod(SOCK_PATH, 0o600)
+    srv.listen(8)
+    log("listening on %s (fm pcm %s)" % (SOCK_PATH, fm_pcm()))
+    try:
+        while True:
+            conn, _ = srv.accept()
+            threading.Thread(target=serve, args=(conn,), daemon=True).start()
+    finally:
+        try:
+            os.unlink(SOCK_PATH)
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    main()
